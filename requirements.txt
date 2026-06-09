@@ -1,0 +1,15 @@
+# Core runtime dependencies (bundled into the exe / installed on first run).
+truststore
+numpy
+soundcard
+soundfile
+darkdetect
+sv-ttk
+faster-whisper
+
+# GPU acceleration (fetched only on machines with an NVIDIA card).
+# nvidia-cublas-cu12
+# nvidia-cudnn-cu12
+
+# Build-time only.
+# pyinstaller

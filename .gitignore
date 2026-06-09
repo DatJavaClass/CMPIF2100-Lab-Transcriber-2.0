@@ -1,0 +1,27 @@
+# Assistant / operational files (not part of the project itself)
+CLAUDE.md
+.claude/
+
+# Build output
+build/
+dist/
+*.spec
+build_log.txt
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# The portable executable is too large for the repo (over GitHub's 100 MB
+# per-file limit). It is published as a Release asset instead.
+*.exe
+
+# OS and editor cruft
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# Editor/tool scratch files
+*.tmp.*
