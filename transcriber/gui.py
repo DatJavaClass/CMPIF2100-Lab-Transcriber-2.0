@@ -1,9 +1,7 @@
-"""Tkinter GUI for CMPIF2100 Lab Transcriber 2.0.
+"""Tkinter GUI: Sun Valley theme, follows the Windows light/dark setting.
 
-A Sun Valley themed window that follows the Windows light/dark setting, lets
-the user pick a loopback device and a save location, and shows live transcript
-text while recording. All Session callbacks arrive on worker threads and are
-marshalled onto the Tk thread before any widget is touched.
+Session callbacks arrive on worker threads; _post marshals them onto the
+Tk thread before any widget is touched.
 """
 import os
 import threading
@@ -59,20 +57,11 @@ MIT_LICENSE = (
     "USE OR OTHER DEALINGS IN THE SOFTWARE."
 )
 
-# Transcript pane colors per theme. ttk has no Text widget, so these are set
-# directly to match the active sv_ttk palette.
+## Transcript pane colors per theme; ttk has no Text widget.
 TEXT_COLORS = {
     "dark": {"bg": "#1c1c1c", "fg": "#e8e8e8", "insert": "#e8e8e8"},
     "light": {"bg": "#ffffff", "fg": "#1c1c1c", "insert": "#1c1c1c"},
 }
-
-
-def _enable_dpi_awareness():
-    try:
-        import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
 
 
 def _current_theme():
@@ -81,32 +70,27 @@ def _current_theme():
 
 def _default_dest_dir():
     desktop = Path.home() / "Desktop"
-    if desktop.is_dir():
-        return desktop
-    return Path.home()
+    return desktop if desktop.is_dir() else Path.home()
 
 
 def _default_basename():
-    # Computed lazily so importing this module stays side-effect free.
-    from datetime import datetime
+    from datetime import datetime ## lazy; module import stays side-effect free
     return "Lab Recording " + datetime.now().strftime("%Y-%m-%d %H%M")
 
 
 class TranscriberWindow:
     def __init__(self, root):
         self.root = root
-        self.session = None
-        self.devices = []
-        self.dest_dir = _default_dest_dir()
-        self.last_transcript = None
-        self._busy = False           # True while a deps operation runs
+        self.session, self.devices = None, []
+        self.dest_dir, self.last_transcript = _default_dest_dir(), None
+        self._busy = False ## a deps operation is running
         self._closed = False
 
         root.title(WINDOW_TITLE + " " + VERSION)
         root.geometry(DEFAULT_SIZE)
         root.minsize(*MIN_SIZE)
 
-        # Build top to bottom: menu bar, then each row of the window.
+        ## Menu bar, then each row, top to bottom.
         self._build_menubar()
         self._build_header()
         self._build_device_row()
@@ -115,11 +99,10 @@ class TranscriberWindow:
         self._build_transcript()
         self._build_status()
 
-        # Kick off the first device scan (runs on a worker thread).
-        self._refresh_devices()
+        self._refresh_devices() ## first scan, runs on a worker
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # Widget construction.
+    ## Widget construction.
 
     def _build_menubar(self):
         menubar = tk.Menu(self.root)
@@ -180,7 +163,7 @@ class TranscriberWindow:
         self.open_btn = ttk.Button(name_row, text="Open Transcript",
                                    command=self._open_transcript)
         self.open_btn.pack(side="left")
-        self.open_btn.state(["disabled"])    # enabled once a transcript exists
+        self.open_btn.state(["disabled"]) ## enabled once a transcript exists
 
     def _build_record_row(self):
         row = ttk.Frame(self.root, padding=(16, 8))
@@ -193,8 +176,7 @@ class TranscriberWindow:
         self.indicator.pack(side="left", padx=(14, 0))
 
     def _build_transcript(self):
-        # The transcript is a plain tk.Text (ttk has no equivalent), so its
-        # colors are set by hand in _apply_text_colors to match the theme.
+        ## Plain tk.Text; _apply_text_colors themes it by hand.
         wrap = ttk.Frame(self.root, padding=(16, 6))
         wrap.pack(fill="both", expand=True)
         scroll = ttk.Scrollbar(wrap, orient="vertical")
@@ -219,11 +201,7 @@ class TranscriberWindow:
         self.progress = ttk.Progressbar(bar, mode="indeterminate", length=180)
         self.progress.pack(side="right")
 
-    # Theme.
-
     def _apply_text_colors(self):
-        # sv_ttk styles the ttk widgets, but the Text pane is plain tk, so match
-        # its background and text to the active light/dark palette by hand.
         colors = TEXT_COLORS.get(_current_theme(), TEXT_COLORS["light"])
         self.transcript.configure(
             background=colors["bg"], foreground=colors["fg"],
@@ -231,12 +209,10 @@ class TranscriberWindow:
             selectbackground="#3a6ea5", selectforeground="#ffffff",
         )
 
-    # Device list and save location.
+    ## Device list and save location.
 
     def _refresh_devices(self):
-        # Enumerate on a worker thread: listing devices imports/calls soundcard,
-        # which would force this UI thread into a multithreaded COM apartment
-        # and break the native folder-picker dialog.
+        ## Worker thread: soundcard's COM init breaks the folder picker.
         self.refresh_btn.state(["disabled"])
         self.status_var.set("Looking for audio devices...")
         threading.Thread(target=self._enumerate_devices, daemon=True).start()
@@ -249,8 +225,7 @@ class TranscriberWindow:
         self._post(self._apply_devices, devs, err)
 
     def _apply_devices(self, devices, err):
-        # Runs back on the UI thread with the worker's results. Don't re-enable
-        # Refresh while a recording is going; _handle_finished does that later.
+        ## Back on the UI thread; Refresh stays off while recording.
         self.devices = devices
         running = bool(self.session and self.session.is_running)
         if not running:
@@ -288,10 +263,10 @@ class TranscriberWindow:
             self.dest_dir = Path(chosen)
             self.dest_var.set(str(self.dest_dir))
 
-    # Recording.
+    ## Recording.
 
     def _toggle_record(self):
-        # The one button does both jobs depending on whether a session is live.
+        ## One button, both jobs.
         if self.session and self.session.is_running:
             self._stop_session()
         else:
@@ -311,15 +286,15 @@ class TranscriberWindow:
         self._set_transcript("")
         self.session = Session(
             self.dest_dir, basename, device=device,
-            on_partial=self._cb_partial,
-            on_status=self._cb_status,
-            on_error=self._cb_error,
-            on_final=self._cb_final,
-            on_finished=self._cb_finished,
+            on_partial=self._cb(self._set_transcript),
+            on_status=self._cb(self.status_var.set),
+            on_error=self._cb(self._handle_error),
+            on_final=self._cb(self._handle_final),
+            on_finished=self._cb(self._handle_finished),
         )
         self.session.start()
 
-        # Flip the UI into recording mode; _handle_finished puts it back.
+        ## Recording mode; _handle_finished flips it back.
         self.record_btn.configure(text="Stop")
         self._set_inputs_enabled(False)
         self.indicator.configure(text="REC", foreground="#e64545")
@@ -333,13 +308,11 @@ class TranscriberWindow:
         self.record_btn.state(["disabled"])
 
     def _set_inputs_enabled(self, enabled):
-        combo_state = "readonly" if enabled else "disabled"
-        self.device_combo.configure(state=combo_state)
+        self.device_combo.configure(state="readonly" if enabled else "disabled")
         for widget in (self.refresh_btn, self.name_entry, self.change_btn):
             widget.state(["!disabled"] if enabled else ["disabled"])
 
-    # Transcript pane updates. The pane is kept disabled (read-only to the
-    # user) and flipped to normal only long enough to change its text.
+    ## Transcript pane: kept read-only, flipped writable just long enough.
 
     def _set_transcript(self, text):
         self.transcript.configure(state="normal")
@@ -355,43 +328,26 @@ class TranscriberWindow:
         self.transcript.configure(state="disabled")
         self.transcript.see("end")
 
-    # Session callbacks. Every one of these arrives on a worker thread, so they
-    # all go through _post, which hops back onto the Tk thread before touching
-    # any widget. The _cb_* methods are the thin marshalling layer; the
-    # _handle_* methods are the real work, already on the UI thread.
+    ## Callbacks land off-thread; _post hops to Tk.
 
     def _post(self, fn, *args):
-        # Marshal a worker-thread callback onto the Tk thread, unless the
-        # window has already been destroyed (close-during-recording).
         if self._closed:
-            return
+            return ## window already torn down
         try:
             self.root.after(0, fn, *args)
         except tk.TclError:
             pass
 
-    def _cb_partial(self, text):
-        self._post(self._set_transcript, text)
-
-    def _cb_status(self, msg):
-        self._post(self.status_var.set, msg)
-
-    def _cb_error(self, msg):
-        self._post(self._handle_error, msg)
-
-    def _cb_final(self, txt_path, clean_text):
-        self._post(self._handle_final, txt_path, clean_text)
-
-    def _cb_finished(self):
-        self._post(self._handle_finished)
+    def _cb(self, fn):
+        ## Marshal a handler onto the Tk thread.
+        return lambda *a: self._post(fn, *a)
 
     def _handle_error(self, msg):
         self.status_var.set(msg)
         messagebox.showerror(WINDOW_TITLE, msg)
 
     def _handle_final(self, txt_path, clean_text):
-        # Reflect the name actually used (it may have been sanitized or had a
-        # (1) suffix added to avoid overwriting an existing file).
+        ## Show the name actually used (sanitized, maybe (1)-suffixed).
         self.last_transcript = Path(txt_path)
         self.open_btn.state(["!disabled"])
         self.name_var.set(Path(txt_path).stem)
@@ -403,23 +359,21 @@ class TranscriberWindow:
             self.open_btn.state(["disabled"])
             return
         try:
-            os.startfile(str(self.last_transcript))   # default text viewer
+            os.startfile(str(self.last_transcript)) ## default text viewer
         except Exception as e:
             messagebox.showerror(WINDOW_TITLE, f"Could not open the transcript:\n{e}")
 
     def _handle_finished(self):
-        # Always called once when a session ends (success, error, or capture
-        # failure). Put the controls back the way they were before recording.
+        ## Fires once per session end; put the controls back.
         self.progress.stop()
         self.indicator.configure(text="")
         self.record_btn.state(["!disabled"])
         self.record_btn.configure(text="Record")
         self._set_inputs_enabled(True)
-        # If the devices vanished meanwhile, keep Record disabled.
         if not self.devices:
-            self.record_btn.state(["disabled"])
+            self.record_btn.state(["disabled"]) ## devices vanished meanwhile
 
-    # The Menu items: re-importing and removing the heavy dependencies.
+    ## Menu: re-importing and removing the heavy dependencies.
 
     def _busy_or_recording(self):
         if self.session and self.session.is_running:
@@ -477,9 +431,8 @@ class TranscriberWindow:
         return [], msg
 
     def _run_deps_job(self, title, work, determinate=True):
-        # Shared driver for the two deps operations: pop a modal progress dialog,
-        # run `work(status, progress)` on a worker thread, and report when done.
-        # work returns (failures, message); failures is empty on success.
+        ## Modal progress dialog around work(status, progress) on a worker.
+        ## work returns (failures, message); failures is empty on success.
         self._busy = True
         top = tk.Toplevel(self.root)
         top.title(title)
@@ -497,11 +450,7 @@ class TranscriberWindow:
         bar.pack(fill="x")
         if not determinate:
             bar.start(12)
-        top.grab_set()
-        top.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - top.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - top.winfo_height()) // 2
-        top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self._center_on_parent(top)
 
         def status(m):
             self._post(sv.set, m)
@@ -532,7 +481,15 @@ class TranscriberWindow:
         elif msg:
             messagebox.showinfo(WINDOW_TITLE, msg)
 
-    # The About dialog and the license text.
+    ## Dialogs: About, license, shared centering.
+
+    def _center_on_parent(self, top):
+        ## Modal grab, then center over the main window.
+        top.grab_set()
+        top.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - top.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - top.winfo_height()) // 2
+        top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     def _show_about(self):
         top = tk.Toplevel(self.root)
@@ -554,8 +511,7 @@ class TranscriberWindow:
         ttk.Button(frm, text="View full license",
                    command=self._show_license).pack(anchor="w", pady=(0, 12))
 
-        # Styled to look and behave like a hyperlink: blue, underlined, hand
-        # cursor, opens the class Slack channel in the default browser.
+        ## Dressed as a hyperlink; opens the class Slack channel.
         link = ttk.Label(frm, text="Give Vic Mad Props In Slack?",
                          foreground="#3a7bdb", cursor="hand2",
                          font=("Segoe UI", 10, "underline"))
@@ -564,11 +520,7 @@ class TranscriberWindow:
 
         ttk.Button(frm, text="Close", command=top.destroy).pack(anchor="e",
                                                                 pady=(16, 0))
-        top.grab_set()
-        top.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - top.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - top.winfo_height()) // 2
-        top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self._center_on_parent(top)
 
     def _show_license(self):
         top = tk.Toplevel(self.root)
@@ -587,11 +539,10 @@ class TranscriberWindow:
                                                                 pady=(12, 0))
         top.grab_set()
 
-    # Closing the window.
+    ## Closing the window.
 
     def _on_close(self):
-        # If a recording is live, confirm, then ask it to stop. _closed tells
-        # the marshaller to drop any callbacks that arrive after we tear down.
+        ## Live recording: confirm, ask it to stop, then tear down.
         if self.session and self.session.is_running:
             if not messagebox.askyesno(
                     WINDOW_TITLE,
@@ -601,16 +552,15 @@ class TranscriberWindow:
                 self.session.stop()
             except Exception:
                 pass
-        self._closed = True
+        self._closed = True ## marshaller drops late callbacks
         self.root.destroy()
 
 
 def run_gui():
-    # Entry point called after bootstrap has installed and wired everything.
-    _enable_dpi_awareness()
+    ## Called after bootstrap has installed and wired everything.
+    bootstrap.enable_dpi_awareness()
     root = tk.Tk()
-    # Match the current Windows light/dark setting; default to light if unknown.
-    sv_ttk.set_theme(darkdetect.theme() or "light")
+    sv_ttk.set_theme(darkdetect.theme() or "light") ## match Windows theme
     TranscriberWindow(root)
     root.mainloop()
 

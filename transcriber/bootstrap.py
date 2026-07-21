@@ -1,15 +1,6 @@
 """First-run setup and runtime wiring.
-
-Two jobs:
-
-1. Make sure the packages the app needs are importable. When running as a
-   plain script we pip-install anything missing into the user's site-packages.
-   When running as a frozen exe the core packages are already bundled, so we
-   only ever fetch the big NVIDIA CUDA wheels, and only if a GPU is present.
-
-2. Point the Windows loader at the cuBLAS/cuDNN DLLs so ctranslate2 can find
-   them at runtime. CUDA is not on PATH on this kind of machine; the libraries
-   arrive as pip wheels and have to be registered with os.add_dll_directory.
+Installs missing packages (frozen: only the CUDA wheels), injects truststore
+TLS, and points the Windows loader at the cuBLAS/cuDNN DLLs.
 """
 import importlib.util
 import math
@@ -22,7 +13,7 @@ from pathlib import Path
 
 SUBPROC_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
-# Core packages, needed on every machine. (import_name, pip_name)
+## Core packages, needed on every machine. (import_name, pip_name)
 CORE_PACKAGES = [
     ("truststore", "truststore"),
     ("numpy", "numpy"),
@@ -33,11 +24,8 @@ CORE_PACKAGES = [
     ("faster_whisper", "faster-whisper"),
 ]
 
-# GPU-only wheels. Big (~1.3 GB), only fetched when an NVIDIA card is present.
-# Versions are pinned to the majors that the bundled ctranslate2 (4.x) is built
-# against: cuBLAS 12.x and cuDNN 9.x. An unpinned install grabs latest, which
-# can be the wrong cuDNN major and fails to load at transcription time.
-# (subdir, pip_name)
+## GPU-only wheels (~1.3 GB), NVIDIA cards only. (subdir, pip_name)
+## Pinned to ctranslate2 4.x majors: cuBLAS 12.x, cuDNN 9.x; latest can mismatch.
 GPU_PACKAGES = [
     ("cublas", "nvidia-cublas-cu12>=12,<13"),
     ("cudnn", "nvidia-cudnn-cu12>=9,<10"),
@@ -50,11 +38,7 @@ def is_frozen() -> bool:
 
 
 def gpu_runtime_dir() -> Path:
-    """Per-user folder the GPU wheels get installed into for a frozen app.
-
-    A frozen exe can't pip-install into its own bundle, so the CUDA wheels go
-    here and this folder is added to the DLL search path at startup.
-    """
+    """Per-user folder the GPU wheels install into for a frozen app."""
     base = os.environ.get("LOCALAPPDATA") or str(Path.home())
     return Path(base) / "CMPIF2100Transcriber" / "gpu_runtime"
 
@@ -72,9 +56,7 @@ def has_nvidia_gpu() -> bool:
 
 
 def _spec_exists(import_name: str, extra_paths=None) -> bool:
-    # Can this module be imported? extra_paths lets us check a location that
-    # isn't on sys.path yet (the per-user GPU runtime) by adding it just for
-    # the lookup and restoring sys.path afterward.
+    ## Import check; extra_paths probes a dir off sys.path.
     if extra_paths:
         saved = list(sys.path)
         sys.path.extend(str(p) for p in extra_paths)
@@ -90,13 +72,8 @@ def _spec_exists(import_name: str, extra_paths=None) -> bool:
         return False
 
 
-def _cuda_dlls_present(subdir):
-    """True if the cuBLAS/cuDNN bin folder actually has DLLs on disk.
-
-    Checking for files, not just an importable nvidia package, so a half-done
-    install (interrupted download, AV quarantine) is treated as missing and
-    re-fetched rather than silently failing at transcription time.
-    """
+def _nvidia_roots():
+    """The nvidia package dir plus the per-user GPU runtime, when present."""
     roots = []
     try:
         import nvidia  # type: ignore
@@ -106,7 +83,13 @@ def _cuda_dlls_present(subdir):
     rt = gpu_runtime_dir() / "nvidia"
     if rt.is_dir():
         roots.append(rt)
-    for root in roots:
+    return roots
+
+
+def _cuda_dlls_present(subdir):
+    """True if the cuBLAS/cuDNN bin folder has DLLs on disk.
+    Checks files, not just an importable package, so a half install re-fetches."""
+    for root in _nvidia_roots():
         bind = root / subdir / "bin"
         if bind.is_dir() and any(bind.glob("*.dll")):
             return True
@@ -114,23 +97,15 @@ def _cuda_dlls_present(subdir):
 
 
 def _can_install_gpu():
-    """A frozen exe needs an external python to install the GPU wheels.
-
-    Without one there's no way to fetch them, so we stay on CPU rather than
-    misfiring the install (running the exe itself as if it were pip).
-    """
+    ## Frozen exe needs external python for GPU wheels.
     if is_frozen():
         return _find_external_python() is not None
     return True
 
 
 def missing_packages():
-    """List of (label, pip_name) that need installing on this machine.
-
-    Core packages are skipped when frozen (they're bundled). GPU packages are
-    only considered when an NVIDIA card is present, their DLLs aren't already
-    on disk, and we actually have a way to install them.
-    """
+    """(label, pip_name) pairs to install on this machine.
+    Core skipped when frozen; GPU only with an NVIDIA card and a way to install."""
     needed = []
     if not is_frozen():
         needed += [p for p in CORE_PACKAGES if not _spec_exists(p[0])]
@@ -146,8 +121,7 @@ def _pip_cmd(pip_name: str, force=False):
     cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check"]
     is_gpu = pip_name.startswith("nvidia-")
     if is_frozen():
-        # The exe has no usable pip; shell out to a real python on PATH.
-        py = _find_external_python()
+        py = _find_external_python() ## exe has no pip; shell out to a real one
         if py:
             cmd[0] = py
     if force:
@@ -157,8 +131,7 @@ def _pip_cmd(pip_name: str, force=False):
         runtime.mkdir(parents=True, exist_ok=True)
         cmd += ["--target", str(runtime)]
     elif sys.prefix == sys.base_prefix:
-        # --user keeps us out of an all-users install; pip rejects it in a venv.
-        cmd.append("--user")
+        cmd.append("--user") ## keep out of all-users; venv rejects it
     cmd.append(pip_name)
     return cmd
 
@@ -178,32 +151,16 @@ def _find_external_python():
 
 def register_cuda_dlls() -> bool:
     """Add the cuBLAS/cuDNN DLL folders to the Windows loader search path.
-
-    Looks in both the importable nvidia package and the per-user GPU runtime
-    dir (where a frozen app stows the wheels). No-op off Windows or when the
-    wheels aren't present.
-    """
+    No-op off Windows or when the wheels aren't present."""
     if not hasattr(os, "add_dll_directory"):
         return False
-
-    roots = []
-    try:
-        import nvidia  # type: ignore
-        roots.append(Path(nvidia.__path__[0]))
-    except ImportError:
-        pass
-    runtime_nvidia = gpu_runtime_dir() / "nvidia"
-    if runtime_nvidia.is_dir():
-        roots.append(runtime_nvidia)
-
     found = False
-    for root in roots:
+    for root in _nvidia_roots():
         for sub in ("cublas", "cudnn", "cuda_nvrtc"):
             d = root / sub / "bin"
             if d.is_dir():
                 try:
-                    # add_dll_directory is what the loader actually uses;
-                    # prepending PATH as well covers tools that still read it.
+                    ## add_dll_directory is what the loader uses; PATH covers the rest.
                     os.add_dll_directory(str(d))
                     os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
                     found = True
@@ -212,12 +169,23 @@ def register_cuda_dlls() -> bool:
     return found
 
 
-def inject_truststore():
-    """Use the OS cert store for TLS so HuggingFace model downloads work.
+def enable_dpi_awareness():
+    """Tell Windows we handle DPI scaling, so the window stays crisp."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
-    huggingface_hub uses httpx, which ignores SSL_CERT_FILE/certifi. Without
-    this, the first model download fails with CERTIFICATE_VERIFY_FAILED.
-    """
+
+def inject_truststore():
+    """Use the OS cert store for TLS so HuggingFace downloads work.
+    huggingface_hub's httpx ignores certifi; without this the first download fails."""
     try:
         import truststore  # type: ignore
         truststore.inject_into_ssl()
@@ -233,12 +201,8 @@ def add_runtime_to_path():
 
 
 def install_packages(to_install, status_cb=None, progress_cb=None, force=False):
-    """pip-install each (label, pip_name), no UI of its own.
-
-    Calls status_cb(message) and progress_cb(0..100) as it goes. Returns a list
-    of (pip_name, error_text) for anything that failed. Safe to run on a worker
-    thread. With force=True, reinstalls even if already present.
-    """
+    """pip-install each (label, pip_name); return [(pip_name, error)] for failures.
+    Calls status_cb(msg) and progress_cb(0..100). Safe on a worker thread."""
     import tempfile
     failures = []
     total = max(1, len(to_install))
@@ -249,8 +213,7 @@ def install_packages(to_install, status_cb=None, progress_cb=None, force=False):
             status_cb(f"Installing {pip_name}  ({idx + 1} of {len(to_install)})...")
         log_path = None
         try:
-            # pip output goes to a logfile, not a PIPE: a chatty install (the big
-            # CUDA wheels) can fill an unread pipe buffer and hang the process.
+            ## pip logs to a file, not a PIPE: a full unread pipe buffer hangs it.
             fd, log_path = tempfile.mkstemp(suffix=".log", prefix="cmpif_pip_")
             with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as logf:
                 proc = subprocess.Popen(
@@ -288,10 +251,8 @@ def install_packages(to_install, status_cb=None, progress_cb=None, force=False):
 
 
 def run_install_splash(to_install, app_name="CMPIF2100 Lab Transcriber"):
-    """Standalone modal splash (own Tk root) that installs the missing packages.
-
-    Used at startup, before the main GUI exists. Returns the failure list.
-    """
+    """Standalone modal Tk splash that installs the missing packages.
+    Used at startup, before the main GUI exists. Returns the failure list."""
     import tkinter as tk
     from tkinter import ttk
 
@@ -382,10 +343,7 @@ def removable_size():
 
 def remove_dependencies():
     """Delete the GPU runtime and cached models. Returns (removed, freed, locked).
-
-    locked is a list of paths that could not be fully removed because a file
-    was in use (a model/DLL loaded by the running app); those clear on restart.
-    """
+    locked = paths still pinned by the running app; they clear on restart."""
     import shutil
     removed, locked, freed = [], [], 0
     for t in removable_targets():
@@ -400,26 +358,21 @@ def remove_dependencies():
 
 
 def reinstall_targets():
-    """Packages to (re)install for a repair: wipe the GPU runtime first so the
-    CUDA wheels come down clean, then whatever is now missing."""
+    """Wipe the GPU runtime, then report what's now missing (repair path)."""
     import shutil
     shutil.rmtree(gpu_runtime_dir(), ignore_errors=True)
     return missing_packages()
 
 
 def ensure_ready(app_name="CMPIF2100 Lab Transcriber"):
-    """Full startup sequence. Returns True if the app can proceed.
-
-    Installs anything missing (showing a splash if so), then wires up TLS and
-    the CUDA DLL search path. On a fatal install failure, shows an error and
-    returns False.
-    """
+    """Full startup: install what's missing, then wire TLS and the CUDA DLL path.
+    Returns True if the app can proceed, False on a fatal install failure."""
     add_runtime_to_path()
     to_install = missing_packages()
     if to_install:
         failures = run_install_splash(to_install, app_name)
         if failures:
-            # A failed GPU install is non-fatal: the app still runs on CPU.
+            ## A failed GPU install is non-fatal: the app still runs on CPU.
             fatal = [(n, e) for n, e in failures if not n.startswith("nvidia-")]
             if fatal:
                 try:

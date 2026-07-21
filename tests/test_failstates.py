@@ -1,8 +1,5 @@
-"""Programmatic fail-state tests for the transcriber engine.
-
-Run directly: python tests/test_failstates.py
-These do not need a microphone with sound; loopback silence is enough to
-drive the lifecycle. The GPU path needs the medium.en model cached.
+"""Fail-state tests for the engine. Run: python tests/test_failstates.py
+Loopback silence drives the lifecycle; the GPU path needs medium.en cached.
 """
 import sys
 import tempfile
@@ -82,7 +79,7 @@ def test_uniquify_no_overwrite():
 
 def test_prepare_dest_not_writable():
     print("test_prepare_dest_not_writable")
-    # Point dest at an existing FILE so mkdir fails: simulates an unusable path.
+    ## dest is a FILE, so mkdir fails.
     tmp = Path(tempfile.mkdtemp()) / "afile"
     tmp.write_text("x")
     s = Session(tmp, "Lab")
@@ -139,7 +136,7 @@ def test_stop_during_load():
     c = Collector()
     s = c.session(dest, "Stop During Load")
     s.start()
-    time.sleep(1.0)            # well before a cold model load completes
+    time.sleep(1.0) ## before a cold model load finishes
     s.stop()
     ok = c.finished.wait(120)
     check("finished fired", ok)
@@ -154,10 +151,10 @@ def test_double_stop_and_start():
     c = Collector()
     s = c.session(dest, "Double Ops")
     s.start()
-    s.start()                  # second start must be a no-op
+    s.start() ## second start must be a no-op
     time.sleep(11)
     s.stop()
-    s.stop()                   # second stop must be a no-op
+    s.stop() ## second stop must be a no-op
     ok = c.finished.wait(120)
     check("finished fired", ok)
     check("exactly one finished despite double stop", c.finished_count == 1,

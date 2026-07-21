@@ -1,11 +1,5 @@
 """System (loopback) audio capture.
-
-Records what's playing on the PC (Zoom, Teams, a recorded lecture) using
-WASAPI loopback via the soundcard library. soundcard resamples to whatever
-rate we ask for, so we ask for 16 kHz directly (Whisper's native rate) and
-only have to downmix to mono. Each captured block is streamed straight to the
-output .wav and also pushed to a queue for live transcription, so a long
-recording never has to be held in RAM.
+Streams WASAPI loopback to a 16 kHz mono .wav and a live queue, never RAM.
 """
 import queue
 import threading
@@ -13,23 +7,18 @@ from pathlib import Path
 
 import numpy as np
 
-# soundcard is imported lazily inside the functions below, never at module
-# load. Importing it calls CoInitializeEx and forces the calling thread into a
-# multithreaded COM apartment; if that happened on the Tk UI thread it would
-# break the native folder-picker dialog (which needs a single-threaded
-# apartment). All soundcard use therefore happens on worker threads.
+## soundcard is imported lazily, on worker threads only: its CoInitializeEx
+## forces an MTA apartment that would break Tk's folder-picker dialog.
 
-TARGET_SR = 16000          # Whisper's native sample rate; soundcard resamples to it.
-BLOCK_SECONDS = 0.5        # How often we pull audio from the device.
+TARGET_SR = 16000 ## Whisper's native rate; soundcard resamples to it
+BLOCK_SECONDS = 0.5 ## how often we pull audio from the device
 
 
 class Device:
-    """A capturable audio source. id is the soundcard device id."""
+    """A capturable audio source; id is the soundcard device id."""
 
     def __init__(self, id, name, is_loopback):
-        self.id = id
-        self.name = name
-        self.is_loopback = is_loopback
+        self.id, self.name, self.is_loopback = id, name, is_loopback
 
     def __repr__(self):
         tag = "loopback" if self.is_loopback else "input"
@@ -37,10 +26,7 @@ class Device:
 
 
 def list_loopback_devices():
-    """Loopback (system-audio) sources, default speaker first.
-
-    Call this from a worker thread, not the UI thread (see the module note).
-    """
+    """Loopback (system-audio) sources, default speaker first. Worker thread only."""
     import soundcard as sc
     try:
         default_spk = sc.default_speaker()
@@ -52,11 +38,8 @@ def list_loopback_devices():
         mics = []
 
     loopbacks = [m for m in mics if getattr(m, "isloopback", False)]
-    # Put the loopback that matches the current default speaker first so the
-    # dropdown defaults to whatever the user is actually hearing, then add the
-    # rest. seen guards against listing the same device twice.
-    seen = set()
-    ordered = []
+    ## Default-speaker loopback first so the dropdown matches playback; seen dedups.
+    seen, ordered = set(), []
     if default_spk is not None:
         for m in loopbacks:
             if m.name == default_spk.name and m.id not in seen:
@@ -86,9 +69,8 @@ def _to_mono(block):
 class LoopbackRecorder:
     """Captures a loopback device on a background thread.
 
-    Mono/16k blocks are streamed to `wav_path` as they arrive and also put on
-    `chunk_queue` for the live engine. If a write fails (folder removed, disk
-    full) the capture stops and the reason is left in `self.error`.
+    Mono/16k blocks stream to wav_path and onto chunk_queue as they arrive. A
+    write failure stops capture and leaves the reason in self.error.
     """
 
     def __init__(self, device=None, wav_path=None):
@@ -100,14 +82,12 @@ class LoopbackRecorder:
         self.wav_path = Path(wav_path) if wav_path else None
         self.chunk_queue = queue.Queue()
         self.frames_written = 0
-        self.error = None
-        self._writer = None
+        self.error = self._writer = self._thread = None
         self._writer_lock = threading.Lock()
-        self._thread = None
         self._stop = threading.Event()
 
     def start(self):
-        # Reset state so a recorder instance could in principle be reused.
+        ## Reset state so a recorder instance could be reused.
         self._stop.clear()
         self.error = None
         self.frames_written = 0
@@ -115,17 +95,14 @@ class LoopbackRecorder:
         self._thread.start()
 
     def _run(self):
-        # Runs on its own thread. soundcard is imported here, not at module
-        # level, so the COM-apartment switch it triggers lands on this thread
-        # rather than the UI thread.
+        ## soundcard imported here so its COM switch avoids the UI thread.
         try:
             import soundcard as sc
             mic = sc.get_microphone(self.device.id, include_loopback=True)
             frames_per_block = max(1, int(TARGET_SR * BLOCK_SECONDS))
             with mic.recorder(samplerate=TARGET_SR, channels=None) as rec:
                 while not self._stop.is_set():
-                    # record() blocks until it has a full block, which paces
-                    # the loop without us needing to sleep.
+                    ## record() blocks for a full block, pacing the loop.
                     data = rec.record(numframes=frames_per_block)
                     block = _to_mono(data)
                     if block.size:
@@ -134,10 +111,9 @@ class LoopbackRecorder:
         except Exception as e:
             self.error = f"{type(e).__name__}: {e}"
         finally:
-            # Always close the file and signal the consumer, even on error, so
-            # the live side never blocks waiting on a stream that has ended.
+            ## Close the file and signal the consumer even on error.
             self._close_writer()
-            self.chunk_queue.put(None)  # sentinel: stream ended
+            self.chunk_queue.put(None) ## sentinel: stream ended
 
     def _write(self, block):
         if self.wav_path is None:
@@ -146,8 +122,7 @@ class LoopbackRecorder:
         with self._writer_lock:
             if self._writer is None:
                 import soundfile as sf
-                # Opened lazily so a recording that captured nothing leaves no
-                # file behind.
+                ## Opened lazily so a silent recording leaves no file behind.
                 self._writer = sf.SoundFile(
                     str(self.wav_path), mode="w", samplerate=TARGET_SR,
                     channels=1, subtype="PCM_16")
@@ -155,8 +130,7 @@ class LoopbackRecorder:
             self.frames_written += block.size
 
     def _close_writer(self):
-        # Locked so a wedged capture thread can't write while we close the file
-        # the final pass is about to read.
+        ## Locked so a wedged capture thread can't write mid-close.
         with self._writer_lock:
             if self._writer is not None:
                 try:

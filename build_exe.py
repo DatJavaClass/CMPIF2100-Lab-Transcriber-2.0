@@ -1,13 +1,5 @@
 """Build the portable Windows exe with PyInstaller.
-
-Hybrid bundle: the app and the CPU transcription stack go inside the exe, but
-the ~1.3 GB NVIDIA CUDA wheels are deliberately excluded. On a machine with an
-NVIDIA card the app fetches those at first run (see transcriber/bootstrap.py),
-which keeps this exe small while GPU acceleration still works.
-
-Usage:
-    python build_exe.py            # one-file portable exe (default)
-    python build_exe.py --onedir   # one-folder build (more robust, easier to debug)
+Hybrid: app + CPU stack bundled; the ~1.3 GB CUDA wheels fetch at first run.
 """
 import shutil
 import subprocess
@@ -18,13 +10,13 @@ ROOT = Path(__file__).resolve().parent
 ENTRY = ROOT / "CMPIF2100_Lab_Transcriber.pyw"
 APP_NAME = "CMPIF2100 Lab Transcriber 2.0"
 
-# Packages whose data files / submodules PyInstaller won't find on its own.
+## Packages PyInstaller misses (data files / submodules).
 COLLECT_ALL = [
-    "faster_whisper",     # includes the bundled Silero VAD asset (vad_filter=True)
+    "faster_whisper", ## bundles the Silero VAD asset (vad_filter=True)
     "ctranslate2",
     "soundcard",
-    "cffi",               # soundcard's WASAPI backend is cffi-based
-    "comtypes",           # soundcard uses COM on Windows
+    "cffi", ## soundcard's WASAPI backend is cffi
+    "comtypes", ## soundcard uses COM on Windows
     "soundfile",
     "sv_ttk",
     "darkdetect",
@@ -43,7 +35,7 @@ HIDDEN_IMPORTS = [
     "transcriber.bootstrap",
 ]
 
-# Kept out on purpose: GPU wheels (fetched at runtime) and heavy unused libs.
+## Excluded: GPU wheels (runtime-fetched) and unused heavies.
 EXCLUDES = [
     "nvidia",
     "torch",
@@ -56,17 +48,15 @@ EXCLUDES = [
 
 
 def main():
-    onedir = "--onedir" in sys.argv
+    onedir = "--onedir" in sys.argv ## else the default one-file build
 
-    # Start from a clean slate so stale artifacts can't leak into the build.
+    ## Clean slate so stale artifacts can't leak into the build.
     for d in ("build", "dist"):
         p = ROOT / d
         if p.exists():
             shutil.rmtree(p, ignore_errors=True)
 
-    # --windowed: no console window. collect-all pulls each tricky package's
-    # data files and submodules; the excludes keep the GPU wheels and other
-    # unused heavyweights out of the bundle.
+    ## --windowed hides the console; collect-all pulls each tricky package whole.
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean", "--windowed",

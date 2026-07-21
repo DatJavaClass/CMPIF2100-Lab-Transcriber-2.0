@@ -1,34 +1,7 @@
 """Live record-and-transcribe session.
 
-A Session ties the loopback recorder to a faster-whisper model. While
-recording it transcribes a rolling buffer every few seconds and pushes the
-growing text out through a callback, so the GUI can show words as they land.
-The recorder streams the audio straight to a .wav. On stop the session runs
-one clean full-file pass with the larger model and saves that as the .txt
-(with the Pitt notice). The live text is a preview; the saved transcript is
-the accurate one.
-
-How the GUI drives a session:
-
-    from transcriber.engine import Session
-    from transcriber import audio
-
-    audio.list_loopback_devices() -> [Device]      # for a device dropdown
-    audio.default_loopback_device() -> Device | None
-
-    s = Session(dest_dir, basename, device=None,
-                on_partial=fn(text:str),
-                on_status=fn(msg:str),
-                on_error=fn(msg:str),
-                on_final=fn(txt_path:Path, clean_text:str),
-                on_finished=fn())            # always fires when a session ends
-    s.start()
-    s.stop()             # returns immediately; final pass runs in background
-    s.is_running         # bool
-    s.device_label       # "GPU" or "CPU" once started
-
-All callbacks are invoked from worker threads. A Tk GUI should marshal them
-onto the UI thread with root.after.
+Live text is a rolling preview; the saved .txt is one clean full-file
+pass on stop. Callbacks fire on worker threads; marshal before Tk use.
 """
 import queue
 import re
@@ -48,13 +21,10 @@ COPYRIGHT_NOTICE = (
     "without the express permission of the University."
 )
 
-# Live-preview pacing. The buffer is transcribed in small chunks that are
-# committed once each (never re-transcribed), so the work per second of audio
-# stays flat and the preview can't fall behind. On a GPU we also refresh a
-# cheap partial of the not-yet-committed tail for a snappier feel.
-LIVE_COMMIT_SECONDS = 5.0     # commit (lock in) a chunk this big
-LIVE_PARTIAL_STEP = 1.0       # GPU only: refresh the uncommitted tail this often
-LIVE_LOAD_CAP = 20.0          # cap the buffer while the model is still loading
+## Chunks commit once, never re-transcribed; per-second work stays flat.
+LIVE_COMMIT_SECONDS = 5.0 ## lock in a chunk this big
+LIVE_PARTIAL_STEP = 1.0 ## GPU only: uncommitted tail refresh rate
+LIVE_LOAD_CAP = 20.0 ## buffer cap while the model loads
 
 _SR = audio.TARGET_SR
 _ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -65,82 +35,58 @@ def _noop(*_a, **_k):
 
 
 def safe_basename(name, fallback="Lab Recording"):
-    """A filename safe on Windows: illegal chars stripped, trailing dots/spaces
-    trimmed, reserved device names avoided. Empty input falls back."""
+    """Windows-safe filename; empty input falls back."""
     name = _ILLEGAL.sub("", (name or "")).strip().rstrip(". ")
     if not name:
         return fallback
     reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} \
-        | {f"LPT{i}" for i in range(1, 10)}
+        | {f"LPT{i}" for i in range(1, 10)} ## reserved device names, thanks DOS
     if name.upper() in reserved:
         name = name + "_"
     return name[:180]
 
 
 def pick_models():
-    """Choose (live_model, final_model, device, compute) for this machine.
-
-    GPU: medium.en live and final (it keeps up easily).
-    CPU: small.en for the responsive live preview, medium.en for the final
-    clean pass.
-    """
+    """(live, final, device, compute) for this machine."""
     from .bootstrap import register_cuda_dlls
     if register_cuda_dlls():
-        return ("medium.en", "medium.en", "cuda", "float16")
-    return ("small.en", "medium.en", "cpu", "int8")
+        return ("medium.en", "medium.en", "cuda", "float16") ## GPU keeps up live
+    return ("small.en", "medium.en", "cpu", "int8") ## small live, medium final
 
 
 class Session:
     def __init__(self, dest_dir, basename, device=None,
                  on_partial=None, on_status=None, on_error=None,
                  on_final=None, on_finished=None):
-        self.dest_dir = Path(dest_dir)
-        self.basename = safe_basename(basename)
+        self.dest_dir, self.basename = Path(dest_dir), safe_basename(basename)
         self.device = device
-        self.on_partial = on_partial or _noop
-        self.on_status = on_status or _noop
-        self.on_error = on_error or _noop
-        self.on_final = on_final or _noop
+        self.on_partial, self.on_status = on_partial or _noop, on_status or _noop
+        self.on_error, self.on_final = on_error or _noop, on_final or _noop
         self.on_finished = on_finished or _noop
 
-        self.is_running = False
-        self.device_label = None
-        self._recorder = None
-        self._live_model = None
-        self._final_model = None
-        self._live_name = None
-        self._final_name = None
-        self._whisper_device = None
-        self._compute = None
-        self._consumer = None
-        self._committed = ""        # text already locked in for the live view
-        self._fast = False          # GPU: cheap enough to show partial previews
+        self.is_running, self.device_label = False, None
+        self._recorder = self._consumer = None
+        self._live_model = self._final_model = None
+        self._live_name = self._final_name = None
+        self._whisper_device = self._compute = None
+        self._committed = "" ## text locked into the live view
+        self._fast = False ## GPU: partial previews are cheap
         self._stopping = False
 
-        # A session juggles three threads (start worker, capture/consumer,
-        # stop worker), so a few primitives keep them honest:
-        #   _model_ready  set once the live model is loaded and usable
-        #   _model_lock   serialises model loads so two threads never load at once
-        #   _finalize     runs at most once, whether reached by Stop or a failure
-        #   _finished     fires the on_finished callback exactly once
-        self._model_ready = threading.Event()
-        self._model_lock = threading.Lock()
-        self._finalize_lock = threading.Lock()
-        self._finalized = False
-        self._finish_lock = threading.Lock()
-        self._finished_fired = False
+        ## Three threads share a session; keep them honest.
+        self._model_ready = threading.Event() ## live model usable
+        self._model_lock = threading.Lock() ## one model load at a time
+        self._finalize_lock, self._finalized = threading.Lock(), False
+        self._finish_lock, self._finished_fired = threading.Lock(), False
 
-    # Starting, stopping, and the worker that loads the model.
+    ## Lifecycle: start, stop, model load.
 
     def start(self):
-        # Guarded so a double-click on Record can't launch two sessions.
         if self.is_running:
-            return
-        self.is_running = True
-        self._stopping = False
+            return ## double-click guard
+        self.is_running, self._stopping = True, False
         self._committed = ""
-        self._finalized = False
-        self._finished_fired = False
+        self._finalized = self._finished_fired = False
         self._model_ready.clear()
         threading.Thread(target=self._start_worker, daemon=True).start()
 
@@ -153,15 +99,13 @@ class Session:
             wav_path = self.dest_dir / (self.basename + ".wav")
             self._recorder = audio.LoopbackRecorder(self.device, wav_path=wav_path)
 
-            # Start capture first so no audio is lost while the model loads
-            # (the model download/load can take longer than a short clip).
+            ## Capture first; a model load must not cost audio.
             self._recorder.start()
             time.sleep(0.2)
             if self._recorder.error:
                 raise RuntimeError(self._recorder.error)
 
-            # The consumer buffers audio right away and waits for the model
-            # before it starts producing live text.
+            ## Consumer buffers now, produces text once the model lands.
             self._consumer = threading.Thread(target=self._consume, daemon=True)
             self._consumer.start()
 
@@ -173,9 +117,8 @@ class Session:
             self._model_ready.set()
             self.on_status(f"Recording and transcribing on {self.device_label}...")
         except Exception as e:
-            # No recording happened; report and bail without a final pass.
-            self._stopping = True
-            self._finalized = True
+            ## Nothing recorded; report and bail, no final pass.
+            self._stopping = self._finalized = True
             if self._recorder is not None:
                 self._recorder.stop()
             self.is_running = False
@@ -193,7 +136,7 @@ class Session:
         self._uniquify()
 
     def _uniquify(self):
-        """Avoid silently overwriting an existing recording with the same name."""
+        ## No silent overwrites; append (1), (2), etc.
         base, i, cand = self.basename, 1, self.basename
         while ((self.dest_dir / (cand + ".wav")).exists()
                or (self.dest_dir / (cand + ".txt")).exists()):
@@ -214,41 +157,31 @@ class Session:
                 return WhisperModel(name, device=self._whisper_device,
                                     compute_type=self._compute)
             except Exception:
-                # GPU can fail even when nvidia-smi works (driver/runtime skew).
-                if self._whisper_device == "cuda":
-                    self.on_status("GPU unavailable, using CPU...")
-                    self._whisper_device = "cpu"
-                    self._compute = "int8"
-                    self.device_label = "CPU"
-                    return WhisperModel(cpu_fallback or name, device="cpu",
-                                        compute_type="int8")
-                raise
+                if self._whisper_device != "cuda":
+                    raise
+                ## GPU can fail even when nvidia-smi works.
+                self.on_status("GPU unavailable, using CPU...")
+                self._whisper_device, self._compute = "cpu", "int8"
+                self.device_label = "CPU"
+                return WhisperModel(cpu_fallback or name, device="cpu",
+                                    compute_type="int8")
 
     def stop(self):
-        # _stopping marks this as a deliberate stop so the consumer thread does
-        # not also treat the stream ending as a capture failure.
         if not self.is_running or self._stopping:
             return
-        self._stopping = True
+        self._stopping = True ## deliberate stop, not a capture failure
         self.on_status("Finishing up...")
         threading.Thread(target=self._stop_and_finalize, daemon=True).start()
 
     def _stop_and_finalize(self):
-        # Stopping the recorder closes the .wav and unblocks the consumer; then
-        # we run the clean pass over the finished file.
+        ## Recorder stop closes the .wav and unblocks the consumer.
         if self._recorder is not None:
             self._recorder.stop()
         self._finalize(None)
 
-    # The live preview: turning captured audio into text as it arrives.
+    ## Live preview: captured audio to text.
 
     def _consume(self):
-        """Stream captured blocks into the live preview.
-
-        Each ~LIVE_COMMIT_SECONDS chunk is transcribed once and locked into the
-        committed text, then dropped, so per-second work stays flat. On a GPU
-        the uncommitted tail is also previewed between commits.
-        """
         pending = np.empty(0, dtype=np.float32)
         last_partial = time.time()
         q = self._recorder.chunk_queue
@@ -259,12 +192,11 @@ class Session:
             except queue.Empty:
                 block = _EMPTY
             if block is None:
-                break
+                break ## sentinel: stream ended
             if block is not _EMPTY and block.size:
                 pending = np.concatenate([pending, block])
 
-            # While the model is still loading, keep capturing but cap the live
-            # buffer. The recorder streams every frame to the .wav regardless.
+            ## Model still loading: keep capturing, cap the live buffer.
             if not self._model_ready.is_set():
                 cap = int(LIVE_LOAD_CAP * _SR)
                 if pending.size > cap:
@@ -285,16 +217,14 @@ class Session:
         if self._model_ready.is_set() and pending.size >= int(0.3 * _SR):
             self._commit(pending)
 
-        # The recorder ending on its own (device unplugged, driver error) while
-        # the user hasn't pressed Stop is a capture failure: salvage and report.
+        ## Stream died without Stop: capture failure, salvage and report.
         if (self._recorder is not None and self._recorder.error
                 and not self._stopping):
             threading.Thread(target=self._finalize,
                              args=(self._recorder.error,), daemon=True).start()
 
     def _commit(self, chunk):
-        # Lock this chunk's text into the running transcript and clear the
-        # window. Passing "" to _emit_live shows the committed text on its own.
+        ## Lock this chunk's text in; "" clears the window.
         text = self._transcribe_buffer(chunk)
         if text:
             self._committed = (self._committed + " " + text).strip()
@@ -314,15 +244,13 @@ class Session:
             return ""
 
     def _emit_live(self, window_text):
-        # The preview is always the locked-in text plus the current window, so
-        # the GUI can just replace its pane with this string each time.
+        ## Committed text plus window; the GUI just swaps its pane.
         self.on_partial((self._committed + " " + window_text).strip())
 
-    # Stopping cleanly and writing the accurate final transcript.
+    ## Shutdown and the accurate final transcript.
 
     def _finalize(self, capture_error):
-        # The once-only guard: Stop and a mid-recording capture failure can both
-        # land here, but only the first gets to run the save and final pass.
+        ## Stop and capture failure both land here; first one wins.
         with self._finalize_lock:
             if self._finalized:
                 return
@@ -361,14 +289,10 @@ class Session:
             self._signal_finished()
 
     def _final_pass(self, wav_path):
-        # Resolve models here too: if the user stopped before the live model
-        # finished loading, this is the first place the model gets set up.
-        self._resolve_models()
+        self._resolve_models() ## stopped before load: first setup is here
         if self._final_model is None:
-            # Reuse the live model when it is the same one, otherwise load the
-            # larger accuracy model for the saved transcript.
             if self._final_name == self._live_name and self._live_model is not None:
-                self._final_model = self._live_model
+                self._final_model = self._live_model ## same model, reuse it
             else:
                 self.on_status("Loading the accuracy model for the final pass...")
                 self._final_model = self._load_model(
@@ -388,13 +312,13 @@ class Session:
         try:
             return go(model)
         except Exception:
-            # A long recording can exhaust GPU memory; finish it on the CPU.
-            if self._whisper_device == "cuda":
-                self.on_status("GPU ran out of memory; finishing on CPU...")
-                from faster_whisper import WhisperModel  # type: ignore
-                return go(WhisperModel(self._final_name, device="cpu",
-                                       compute_type="int8"))
-            raise
+            if self._whisper_device != "cuda":
+                raise
+            ## Long recordings can exhaust VRAM; finish on CPU.
+            self.on_status("GPU ran out of memory; finishing on CPU...")
+            from faster_whisper import WhisperModel  # type: ignore
+            return go(WhisperModel(self._final_name, device="cpu",
+                                   compute_type="int8"))
 
     def _write_transcript(self, body):
         content = f"{body}\n\n{'-' * 78}\n{COPYRIGHT_NOTICE}\n"
@@ -403,7 +327,7 @@ class Session:
             txt_path.write_text(content, encoding="utf-8")
             return txt_path
         except OSError:
-            # Save folder went away or filled up: keep the transcript anyway.
+            ## Folder vanished or filled; temp keeps the transcript alive.
             fb = Path(tempfile.gettempdir()) / (self.basename + ".txt")
             fb.write_text(content, encoding="utf-8")
             self.on_status(f"Could not write to the chosen folder; saved the "
@@ -411,8 +335,7 @@ class Session:
             return fb
 
     def _signal_finished(self):
-        # Fire on_finished exactly once so the GUI resets its controls a single
-        # time, no matter how the session wound down.
+        ## on_finished fires once, however the session wound down.
         with self._finish_lock:
             if self._finished_fired:
                 return
@@ -420,6 +343,4 @@ class Session:
         self.on_finished()
 
 
-# Shared empty array, reused as the "queue timed out, nothing new" marker so we
-# are not allocating a throwaway array on every idle tick.
-_EMPTY = np.empty(0, dtype=np.float32)
+_EMPTY = np.empty(0, dtype=np.float32) ## idle-tick marker, no throwaway allocs
